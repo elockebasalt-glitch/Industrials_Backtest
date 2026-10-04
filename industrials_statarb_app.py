@@ -13,7 +13,7 @@ import industrials_statarb as sa
 
 st.set_page_config(page_title="Industrials stat-arb research", layout="wide")
 st.title("Industrials stat-arb research")
-st.caption("Mean-reversion pairs within sub-sectors and trend following on daily adjusted closes. "
+st.caption("Mean-reversion pairs within sub-sectors on daily adjusted closes, with optional trend following. "
            "Research tool only: it places no orders, and backtest results are not a forecast.")
 
 GROUPS = list(sa.SUBSECTORS)
@@ -43,22 +43,30 @@ with st.sidebar.form("settings"):
     hl_range = st.slider("Half-life range, days", 1, 120, (2, 45))
 
     st.header("Pair rules")
-    lookback = st.slider("Z-score lookback, days", 20, 252, 60, 5)
+    spread_mode = st.radio("Spread parameters", ["Fixed from the training window", "Rolling, re-estimated daily"],
+                           help="Fixed freezes each pair's hedge ratio, mean and sigma from the window it was "
+                                "screened on, so z returns to zero only if the spread itself converges.")
+    lookback = st.slider("Z-score lookback, days (rolling only)", 20, 252, 60, 5)
     entry = st.slider("Entry |z|", 1.0, 3.5, 2.0, 0.1)
-    exit_ = st.slider("Exit |z|", 0.0, 1.5, 0.5, 0.1)
+    exit_ = st.slider("Exit |z| (0 = spread crosses its mean)", 0.0, 1.5, 0.5, 0.1)
+    use_zstop = st.checkbox("Z-score stop", True)
     stop = st.slider("Stop |z|", 2.5, 8.0, 4.0, 0.25)
-    max_hold = st.slider("Max holding days", 5, 126, 30, 5)
+    use_tstop = st.checkbox("Time stop", True)
+    tstop_unit = st.radio("Time stop measured in", ["Days", "Multiples of each pair's half-life"])
+    max_hold = st.slider("Time stop, days", 5, 252, 30, 5)
+    hold_hl = st.slider("Time stop, half-lives", 1.0, 8.0, 3.0, 0.5)
     use_macd = st.checkbox("Require MACD turn on the z-score before entry", False)
 
     st.header("Trend rules")
+    use_trend = st.checkbox("Include trend following", False)
     speed_name = st.selectbox("EMA speeds", list(SPEED_SETS), index=3)
     long_only = st.checkbox("Long or flat only (no shorts)", False)
     trend_vol = st.slider("Trend target vol", 0.05, 0.60, 0.20, 0.05)
 
     st.header("Portfolio and costs")
     mix = st.slider("Weight on pairs (rest on trend)", 0.0, 1.0, 0.5, 0.05)
-    use_vt = st.checkbox("Scale combined book to a vol target", True)
-    book_vol = st.slider("Combined target vol", 0.02, 0.40, 0.08, 0.01)
+    use_vt = st.checkbox("Add a vol-targeted book", True)
+    book_vol = st.slider("Book target vol", 0.02, 0.40, 0.08, 0.01)
     cost_bps = st.slider("Cost per trade, bps of notional", 0, 50, 5)
     carry_bps = st.slider("Annual borrow cost on shorts, bps", 0, 1000, 50, 25)
     lag = st.radio("Execution lag, days", [1, 2], horizontal=True)
@@ -66,7 +74,7 @@ with st.sidebar.form("settings"):
     st.header("Walk-forward")
     train = st.slider("Training window, trading days", 250, 1260, 504, 2)
     test = st.slider("Test window, trading days", 21, 252, 63, 21)
-    tune = st.checkbox("Also re-pick lookback and entry each window", True)
+    tune = st.checkbox("Also re-pick entry (and rolling lookback) each window", True)
     st.form_submit_button("Run", type="primary")
 
 tickers = sorted({t for g in groups_sel for t in sa.SUBSECTORS[g]})
@@ -95,23 +103,30 @@ def load(source, tickers, start, csv_bytes):
 def run_in_sample(px, dvol, min_dv, screen_kw, pair_kw, trend_kw, bt_kw):
     names = sa.eligible(px.dropna(axis=1), dvol, min_dv)          # full-history names for pairs
     picks = sa.screen_pairs(px[names], **screen_kw) if len(names) > 1 else pd.DataFrame()
-    plist = list(zip(picks["y"], picks["x"])) if len(picks) else []
-    w_mr = sa.mr_weights(px, plist, **pair_kw) if plist else pd.DataFrame(0.0, index=px.index, columns=px.columns)
+    w_mr = sa.mr_weights(px, picks, **pair_kw) if len(picks) else pd.DataFrame(0.0, index=px.index, columns=px.columns)
     tnames = [c for c in px.columns if dvol is None or min_dv <= 0 or dvol[c].median() >= min_dv]
     w_tr = sa.trend_weights(px[tnames], **trend_kw).reindex(columns=px.columns).fillna(0)
     return picks, w_mr, w_tr, len(names)
 
 
 @st.cache_data(show_spinner="Running walk-forward test (this is the slow one)...")
-def run_walk_forward(px, dvol, min_dv, train, test, screen_kw, pair_kw, grid, trend_kw, speed_sets, bt_kw):
+def run_walk_forward(px, dvol, min_dv, train, test, screen_kw, pair_kw, grid, trend_kw, speed_sets, bt_kw, use_trend):
     w_mr, log_mr = sa.walk_forward_pairs(px, dvol, train, test, min_dv, screen_kw, pair_kw, grid, bt_kw)
+    if not use_trend:
+        return w_mr, log_mr, None, None
     w_tr, log_tr = sa.walk_forward_trend(px, dvol, train, test, min_dv, speed_sets, trend_kw, bt_kw)
     return w_mr, log_mr, w_tr, log_tr
 
 
-def combine(px, w_mr, w_tr):
-    w = mix * w_mr + (1 - mix) * w_tr
-    return sa.vol_target(px, w, book_vol) if use_vt else w
+def make_books(px, w_mr, w_tr):
+    """The books to report. With trend off this is pairs only, plus a vol-targeted copy if asked."""
+    if use_trend:
+        w = mix * w_mr + (1 - mix) * w_tr
+        return {"Pairs": w_mr, "Trend": w_tr, "Combined": sa.vol_target(px, w, book_vol) if use_vt else w}
+    books = {"Pairs": w_mr}
+    if use_vt:
+        books["Pairs (vol-targeted)"] = sa.vol_target(px, w_mr, book_vol)
+    return books
 
 
 def report(px, books, since=None):
@@ -161,10 +176,17 @@ min_dv_usd = min_dv * 1e6 if dvol is not None else 0.0
 
 screen_kw = dict(min_corr=min_corr, adf_max=adf_max, hl_range=tuple(hl_range), top_k=top_k,
                  max_per_name=max_per_name, groups=pair_groups)
-pair_kw = dict(lookback=lookback, entry=entry, exit_=exit_, stop=stop, max_hold=max_hold, use_macd=use_macd)
+fixed = spread_mode.startswith("Fixed")
+by_half_life = use_tstop and tstop_unit != "Days"
+pair_kw = dict(lookback=lookback, entry=entry, exit_=exit_, use_macd=use_macd, fixed=fixed,
+               stop=stop if use_zstop else None,
+               max_hold=max_hold if use_tstop and not by_half_life else None,
+               hold_half_lives=hold_hl if by_half_life else None)
 trend_kw = dict(target_vol=trend_vol, long_only=long_only)
 bt_kw = dict(cost_bps=cost_bps, short_carry_bps=carry_bps, lag=lag)
-grid = {"lookback": [30, 60, 90], "entry": [1.5, 2.0, 2.5]} if tune else None
+grid = None
+if tune:
+    grid = {"entry": [1.5, 2.0, 2.5]} if fixed else {"lookback": [30, 60, 90], "entry": [1.5, 2.0, 2.5]}
 
 if source == "Synthetic demo":
     st.warning("Synthetic demo data: made-up prices with cointegration built in. Results mean nothing "
@@ -202,12 +224,17 @@ with tab_screen:
     st.markdown(f"Screened pairs {scope} among the **{n_full}** names with a full history and enough volume; "
                 f"**{len(picks)}** selected. Ranked by the residual's ADF t-stat (more negative is stronger).")
     if len(picks):
-        st.dataframe(picks.style.format({"beta": "{:.2f}", "adf_t": "{:.2f}", "half_life": "{:.1f}", "corr": "{:.2f}"}))
+        st.dataframe(picks.drop(columns="mu").style.format({"beta": "{:.2f}", "adf_t": "{:.2f}", "half_life": "{:.1f}",
+                                                            "corr": "{:.2f}", "sigma": "{:.1%}"}))
+        st.caption("sigma is one standard deviation of the spread over the screening window: "
+                   "the rough size of a 1-point move in z when parameters are fixed.")
         labels = [f"{y}/{x}" for y, x in zip(picks["y"], picks["x"])]
         chosen = st.selectbox("Inspect a pair", labels)
         y, x = chosen.split("/")
-        z, _ = sa.pair_zscore(px[y], px[x], lookback)
-        st.markdown(f"**Rolling z-score of {chosen}**")
+        row = picks[(picks["y"] == y) & (picks["x"] == x)].iloc[0]
+        z, _ = (sa.pair_zscore(px[y], px[x], beta=row["beta"], mu=row["mu"], sigma=row["sigma"]) if fixed
+                else sa.pair_zscore(px[y], px[x], lookback))
+        st.markdown(f"**{'Fixed-parameter' if fixed else 'Rolling'} z-score of {chosen}**")
         st.line_chart(pd.DataFrame({"z": z, "entry": entry, "-entry": -entry}).dropna())
     else:
         st.info("No pairs passed. Loosen the screen (higher ADF t-stat, lower correlation) or add sub-sectors.")
@@ -216,29 +243,34 @@ with tab_screen:
 
 with tab_is:
     st.warning("In-sample: pairs were selected and traded on the same data, and the settings are whatever "
-               "you chose after looking at results. Treat these numbers as an upper bound.")
-    is_table, _ = report(px, {"Pairs": w_mr, "Trend": w_tr, "Combined": combine(px, w_mr, w_tr)})
+               "you chose after looking at results. Treat these numbers as an upper bound."
+               + (" With fixed parameters each spread's mean and sigma are also taken from the whole sample, "
+                  "so every trade here knows where the spread ends up. Only the walk-forward tab is a fair test."
+                  if fixed else ""))
+    is_table, _ = report(px, make_books(px, w_mr, w_tr))
 
 # ------------------------------------------------------------ walk-forward
 wf_mr, log_mr, wf_tr, log_tr = run_walk_forward(
     px, dvol, min_dv_usd, train, test, screen_kw, pair_kw, grid, trend_kw,
-    list(SPEED_SETS.values()), bt_kw)
-wf_combo = combine(px, wf_mr, wf_tr)
+    list(SPEED_SETS.values()), bt_kw, use_trend)
+wf_books = make_books(px, wf_mr, wf_tr)
 
 with tab_wf:
     oos_start = px.index[train]
     st.markdown(f"Every **{test}** trading days the app re-screens pairs and re-picks parameters on the previous "
-                f"**{train}** days, then trades them on the next {test}. Out-of-sample period starts "
+                f"**{train}** days, then trades them on the next {test}. "
+                + ("Each pair's hedge ratio, mean and sigma are frozen from its training window. " if fixed else "")
+                + f"Out-of-sample period starts "
                 f"**{oos_start.date()}**; costs are charged when the pair set changes.")
-    wf_table, wf_eq = report(px, {"Pairs": wf_mr, "Trend": wf_tr, "Combined": wf_combo}, since=oos_start)
+    wf_table, wf_eq = report(px, wf_books, since=oos_start)
     cmp = pd.DataFrame({"In-sample Sharpe": is_table["Sharpe"], "Walk-forward Sharpe": wf_table["Sharpe"]})
     st.markdown("**In-sample vs walk-forward**")
     st.dataframe(cmp.style.format("{:.2f}"))
     st.caption("A large drop from the first column to the second is the size of the overfitting.")
 
     st.markdown("**Current target weights** (what the walk-forward book holds after the last close)")
-    last = pd.DataFrame({"Pairs": wf_mr.iloc[-1], "Trend": wf_tr.iloc[-1], "Combined": wf_combo.iloc[-1]})
-    last = last[(last.abs() > 1e-4).any(axis=1)].sort_values("Combined")
+    last = pd.DataFrame({k: w.iloc[-1] for k, w in wf_books.items()})
+    last = last[(last.abs() > 1e-4).any(axis=1)].sort_values(last.columns[-1])
     if len(last):
         st.dataframe(last.style.format("{:+.2%}"))
     else:
@@ -247,10 +279,10 @@ with tab_wf:
 
     with st.expander("Pairs chosen in each window"):
         st.dataframe(log_mr)
-    with st.expander("Trend speeds chosen in each window"):
-        st.dataframe(log_tr)
-    out = pd.DataFrame({k: sa.backtest(px, w, **bt_kw)["ret"] for k, w in
-                        {"pairs": wf_mr, "trend": wf_tr, "combined": wf_combo}.items()})
+    if use_trend:
+        with st.expander("Trend speeds chosen in each window"):
+            st.dataframe(log_tr)
+    out = pd.DataFrame({k: sa.backtest(px, w, **bt_kw)["ret"] for k, w in wf_books.items()})
     st.download_button("Download daily out-of-sample returns (CSV)",
                        out[out.index >= oos_start].to_csv().encode(), "walk_forward_returns.csv", "text/csv")
     st.download_button("Download current target weights (CSV)", last.to_csv().encode(),
