@@ -37,10 +37,14 @@ with st.sidebar.form("settings"):
     st.header("Pair screen")
     same_group = st.checkbox("Only pair names that share a sub-sector", True)
     top_k = st.slider("Max pairs to trade", 1, 60, 20)
-    max_per_name = st.slider("Max pairs per name", 1, 10, 2)
-    min_corr = st.slider("Min return correlation", 0.0, 0.95, 0.5, 0.05)
-    adf_max = st.slider("Max residual ADF t-stat", -6.0, -1.5, -3.34, 0.02)
-    hl_range = st.slider("Half-life range, days", 1, 120, (2, 45))
+    max_per_name = st.slider("Max pairs per name", 1, 10, 3)
+    min_corr = st.slider("Min return correlation", 0.0, 0.95, 0.4, 0.05)
+    adf_max = st.slider("Max residual ADF t-stat (-3.04 = 90%, -3.34 = 95%)", -6.0, -1.5, -3.04, 0.02)
+    hl_range = st.slider("Half-life range, days", 1, 120, (1, 90))
+    persist = st.checkbox("Persistence filter (pair must hold up on both halves of the window)", True,
+                          help="The spread must be stationary on the first half of the screening window, and "
+                               "with the first-half hedge ratio and mean frozen it must stay stationary and "
+                               "centred on the second half. Removes most pairs that pass by luck.")
 
     st.header("Pair rules")
     spread_mode = st.radio("Spread parameters", ["Fixed from the training window", "Rolling, re-estimated daily"],
@@ -49,12 +53,12 @@ with st.sidebar.form("settings"):
     lookback = st.slider("Z-score lookback, days (rolling only)", 20, 252, 60, 5)
     entry = st.slider("Entry |z|", 1.0, 3.5, 2.0, 0.1)
     exit_ = st.slider("Exit |z| (0 = spread crosses its mean)", 0.0, 1.5, 0.5, 0.1)
-    use_zstop = st.checkbox("Z-score stop", True)
+    use_zstop = st.checkbox("Z-score stop", False)
     stop = st.slider("Stop |z|", 2.5, 8.0, 4.0, 0.25)
     use_tstop = st.checkbox("Time stop", True)
-    tstop_unit = st.radio("Time stop measured in", ["Days", "Multiples of each pair's half-life"])
-    max_hold = st.slider("Time stop, days", 5, 252, 30, 5)
-    hold_hl = st.slider("Time stop, half-lives", 1.0, 8.0, 3.0, 0.5)
+    tstop_unit = st.radio("Time stop measured in", ["Days", "Multiples of each pair's half-life"], index=1)
+    max_hold = st.slider("Time stop, days", 5, 252, 60, 5)
+    hold_hl = st.slider("Time stop, half-lives", 1.0, 8.0, 4.0, 0.5)
     use_macd = st.checkbox("Require MACD turn on the z-score before entry", False)
 
     st.header("Trend rules")
@@ -107,6 +111,15 @@ def run_in_sample(px, dvol, min_dv, screen_kw, pair_kw, trend_kw, bt_kw):
     tnames = [c for c in px.columns if dvol is None or min_dv <= 0 or dvol[c].median() >= min_dv]
     w_tr = sa.trend_weights(px[tnames], **trend_kw).reindex(columns=px.columns).fillna(0)
     return picks, w_mr, w_tr, len(names)
+
+
+@st.cache_data(show_spinner="Screening current pairs...")
+def run_signals(px, dvol, min_dv, train, screen_kw, pair_kw):
+    """Screen on the latest training window and report where each pair stands after the last close."""
+    w = px.iloc[-train:]
+    names = sa.eligible(w, dvol, min_dv)
+    picks = sa.screen_pairs(w[names], **screen_kw) if len(names) > 1 else pd.DataFrame()
+    return sa.current_signals(w, picks, **pair_kw) if len(picks) else pd.DataFrame()
 
 
 @st.cache_data(show_spinner="Running walk-forward test (this is the slow one)...")
@@ -175,10 +188,10 @@ dvol = None if dvol_all is None else dvol_all.reindex(px.index)
 min_dv_usd = min_dv * 1e6 if dvol is not None else 0.0
 
 screen_kw = dict(min_corr=min_corr, adf_max=adf_max, hl_range=tuple(hl_range), top_k=top_k,
-                 max_per_name=max_per_name, groups=pair_groups)
+                 max_per_name=max_per_name, groups=pair_groups, persist=persist)
 fixed = spread_mode.startswith("Fixed")
 by_half_life = use_tstop and tstop_unit != "Days"
-pair_kw = dict(lookback=lookback, entry=entry, exit_=exit_, use_macd=use_macd, fixed=fixed,
+pair_kw = dict(lookback=lookback, entry=entry, exit_=exit_, use_macd=use_macd, fixed=fixed, slots=top_k,
                stop=stop if use_zstop else None,
                max_hold=max_hold if use_tstop and not by_half_life else None,
                hold_half_lives=hold_hl if by_half_life else None)
@@ -192,8 +205,8 @@ if source == "Synthetic demo":
     st.warning("Synthetic demo data: made-up prices with cointegration built in. Results mean nothing "
                "about real markets; this source only shows that the app works.")
 
-tab_data, tab_screen, tab_is, tab_wf = st.tabs(
-    ["Data", "Pair screen", "Backtest (in-sample)", "Walk-forward (out-of-sample)"])
+tab_sum, tab_data, tab_screen, tab_is, tab_wf = st.tabs(
+    ["Summary", "Data", "Pair screen", "Backtest (in-sample)", "Walk-forward (out-of-sample)"])
 
 # ------------------------------------------------------------ data tab
 with tab_data:
@@ -225,9 +238,13 @@ with tab_screen:
                 f"**{len(picks)}** selected. Ranked by the residual's ADF t-stat (more negative is stronger).")
     if len(picks):
         st.dataframe(picks.drop(columns="mu").style.format({"beta": "{:.2f}", "adf_t": "{:.2f}", "half_life": "{:.1f}",
-                                                            "corr": "{:.2f}", "sigma": "{:.1%}"}))
-        st.caption("sigma is one standard deviation of the spread over the screening window: "
-                   "the rough size of a 1-point move in z when parameters are fixed.")
+                                                            "corr": "{:.2f}", "sigma": "{:.1%}", "t_1st_half": "{:.2f}",
+                                                            "t_2nd_half": "{:.2f}", "shift": "{:+.2f}"}))
+        st.caption("sigma is one standard deviation of the spread over the screening window: the rough size of a "
+                   "1-point move in z when parameters are fixed. t_1st_half and t_2nd_half are the persistence "
+                   "checks on each half of the window, and shift is how far the spread's mean moved between "
+                   f"halves, in sigmas. The filter needs t_1st_half at or below {sa.PERSIST_T_FIRST}, t_2nd_half at or "
+                   f"below {sa.PERSIST_T_SECOND} and shift within ±{sa.PERSIST_SHIFT}.")
         labels = [f"{y}/{x}" for y, x in zip(picks["y"], picks["x"])]
         chosen = st.selectbox("Inspect a pair", labels)
         y, x = chosen.split("/")
@@ -237,7 +254,8 @@ with tab_screen:
         st.markdown(f"**{'Fixed-parameter' if fixed else 'Rolling'} z-score of {chosen}**")
         st.line_chart(pd.DataFrame({"z": z, "entry": entry, "-entry": -entry}).dropna())
     else:
-        st.info("No pairs passed. Loosen the screen (higher ADF t-stat, lower correlation) or add sub-sectors.")
+        st.info("No pairs passed. Loosen the screen (higher ADF t-stat, lower correlation), switch off the "
+                "persistence filter, or add sub-sectors.")
     st.caption("This screen uses the whole sample, so these pairs were chosen with hindsight. "
                "The walk-forward tab re-runs the screen using only past data.")
 
@@ -287,3 +305,55 @@ with tab_wf:
                        out[out.index >= oos_start].to_csv().encode(), "walk_forward_returns.csv", "text/csv")
     st.download_button("Download current target weights (CSV)", last.to_csv().encode(),
                        "target_weights.csv", "text/csv")
+
+# ------------------------------------------------------------ summary
+sig = run_signals(px, dvol, min_dv_usd, train, screen_kw, pair_kw)
+
+with tab_sum:
+    asof = px.index[-1].date()
+    st.markdown(f"Pairs screened on the last **{train}** trading days through **{asof}**"
+                + (" with the persistence filter on" if persist else "")
+                + f". Signals use the sidebar rules: enter at |z| ≥ {entry:g}, exit at |z| ≤ {exit_:g}"
+                + (f", z-stop at {stop:g}" if use_zstop else ", no z-stop")
+                + (f", time stop {hold_hl:g} half-lives." if by_half_life else
+                   f", time stop {max_hold} days." if use_tstop else ", no time stop."))
+    if not len(sig):
+        st.info("No pairs passed the screen on the latest window, so there are no signals. Loosen the screen "
+                "or switch off the persistence filter to see more candidates.")
+    else:
+        active = sig[sig["status"].isin(["New entry", "Open"])]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Pairs screened", len(sig))
+        c2.metric("New entries at the last close", int((sig["status"] == "New entry").sum()))
+        c3.metric("Open trades", int((sig["status"] == "Open").sum()))
+
+        def show(df):
+            view = pd.DataFrame({
+                "Pair": df["pair"], "Sub-sector": df["group"], "Status": df["status"], "Trade": df["trade"],
+                "Long leg": [f"{t} {w:.0%}" if t else "" for t, w in zip(df["long"], df["long_wt"])],
+                "Short leg": [f"{t} {w:.0%}" if t else "" for t, w in zip(df["short"], df["short_wt"])],
+                "z now": df["z"], "Entered": df["entered"], "Days held": df["days_held"],
+                "Days to time stop": df["days_to_time_stop"], "Half-life": df["half_life"],
+                "Hedge ratio": df["hedge_ratio"]})
+            st.dataframe(view.style.format({"z now": "{:+.2f}", "Days held": "{:.0f}", "Days to time stop": "{:.0f}",
+                                            "Half-life": "{:.1f}", "Hedge ratio": "{:.2f}"}, na_rep=""),
+                         hide_index=True)
+
+        st.markdown("**Pairs with a live signal**")
+        if len(active):
+            show(active)
+        else:
+            st.write("None. No screened pair is past its entry level and tradable right now.")
+        st.caption("How to read a trade: the Long and Short legs show each ticker and its share of the money in "
+                   "that pair, set by the hedge ratio. A pair written A/B with z below the negative entry level is "
+                   "Long A / Short B; above the positive entry level it is Short A / Long B. "
+                   f"Each pair is sized at 1/{top_k} of the book. \"New entry\" opened at the last close; "
+                   "\"Open\" was opened earlier and has not yet hit an exit.")
+        st.caption("Check earnings dates on both legs before acting: a spread that moved on one company's "
+                   "results is the kind least likely to revert. This app does not look up earnings dates.")
+        with st.expander(f"All {len(sig)} screened pairs"):
+            show(sig)
+        last_screen = log_mr["test_start"].iloc[-1] if len(log_mr) else None
+        st.caption("This tab re-screens as of the last close and uses the sidebar entry level. The walk-forward "
+                   f"tab's current weights come from its last scheduled re-screen ({last_screen}) and its "
+                   "per-window entry level, so the two can differ.")

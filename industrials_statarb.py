@@ -123,7 +123,39 @@ def candidate_pairs(names, groups=None):
     return iu, ju
 
 
-def screen_pairs(px, min_corr=0.5, adf_max=-3.34, hl_range=(2, 60), top_k=20, max_per_name=3, groups=None):
+PERSIST_T_FIRST = -3.04   # first half, own fit: ~10% Engle-Granger level
+PERSIST_T_SECOND = -2.86  # second half, frozen first-half fit: ~5% Dickey-Fuller level
+PERSIST_SHIFT = 0.5       # allowed move in the spread's mean between halves, in first-half sigmas
+
+
+def _df_t(e):
+    """Dickey-Fuller t-stat (no lags) of each column of e around its own mean."""
+    e = e - e.mean(0)
+    e0, de = e[:-1], np.diff(e, axis=0)
+    sxx = (e0 ** 2).sum(0)
+    rh = (e0 * de).sum(0) / sxx
+    return rh / np.sqrt(((de - e0 * rh) ** 2).sum(0) / (len(de) - 1) / sxx)
+
+
+def _split_check(L, yi, xi):
+    """Fit hedge ratio and mean on the first half of the window, freeze them, test the second half.
+
+    Returns (t-stat of the spread on the first half, t-stat of the frozen spread on the second
+    half, how far its mean moved in first-half sigmas). This rehearses fixed-parameter trading
+    inside the training data.
+    """
+    h = len(L) // 2
+    A, B = L[:h], L[h:]
+    ya, xa = A[:, yi], A[:, xi]
+    xc = xa - xa.mean(0)
+    beta = ((ya - ya.mean(0)) * xc).sum(0) / (xc ** 2).sum(0)
+    ea = ya - beta * xa
+    eb = B[:, yi] - beta * B[:, xi]
+    return _df_t(ea), _df_t(eb), (eb.mean(0) - ea.mean(0)) / ea.std(0)
+
+
+def screen_pairs(px, min_corr=0.5, adf_max=-3.34, hl_range=(2, 60), top_k=20, max_per_name=3, groups=None,
+                 persist=False):
     """Rank candidate pairs in the window by an Engle-Granger style test on the log-price residual.
 
     adf_t is the Dickey-Fuller t-stat (no lags) of the residual; -3.34 is roughly the 5%
@@ -131,8 +163,12 @@ def screen_pairs(px, min_corr=0.5, adf_max=-3.34, hl_range=(2, 60), top_k=20, ma
     so the only fair test of this screen is trading its picks on later data (walk_forward_pairs).
     beta, mu and sigma describe the spread log(y) - beta*log(x) over this window; fixed-parameter
     trading freezes them.
+
+    persist=True adds a split-sample check (see _split_check): the spread must be stationary on the
+    first half of the window, and with the first-half hedge ratio and mean frozen it must stay
+    stationary and centred on the second half. A pair that looks stationary by luck rarely survives.
     """
-    cols = ["y", "x", "group", "beta", "adf_t", "half_life", "corr", "sigma", "mu"]
+    cols = ["y", "x", "group", "beta", "adf_t", "half_life", "corr", "sigma", "t_1st_half", "t_2nd_half", "shift", "mu"]
     px = px.dropna(axis=1)
     n = px.shape[1]
     if n < 2 or len(px) < 60:
@@ -161,9 +197,15 @@ def screen_pairs(px, min_corr=0.5, adf_max=-3.34, hl_range=(2, 60), top_k=20, ma
     with np.errstate(divide="ignore", invalid="ignore"):
         hl = np.where(rho < 0, -np.log(2) / np.log1p(np.clip(rho, -0.999, -1e-12)), np.inf)
     df = pd.DataFrame({"y": names[yi], "x": names[xi], "beta": beta, "adf_t": t,
-                       "half_life": hl, "corr": corr[yi, xi], "sigma": sig, "mu": mu})
+                       "half_life": hl, "corr": corr[yi, xi], "sigma": sig, "mu": mu, "_yi": yi, "_xi": xi})
     df = df[(df["corr"] >= min_corr) & (df["adf_t"] <= adf_max) & (df["beta"] > 0)
             & df["half_life"].between(*hl_range)].sort_values("adf_t")
+    if not len(df):
+        return pd.DataFrame(columns=cols)
+    df["t_1st_half"], df["t_2nd_half"], df["shift"] = _split_check(L, df["_yi"].values, df["_xi"].values)
+    if persist:
+        df = df[(df["t_1st_half"] <= PERSIST_T_FIRST) & (df["t_2nd_half"] <= PERSIST_T_SECOND)
+                & (df["shift"].abs() <= PERSIST_SHIFT)]
     picked, used, seen = [], {}, set()
     for row in df.itertuples(index=False):
         key = frozenset((row.y, row.x))
@@ -173,7 +215,8 @@ def screen_pairs(px, min_corr=0.5, adf_max=-3.34, hl_range=(2, 60), top_k=20, ma
         used[row.y] = used.get(row.y, 0) + 1
         used[row.x] = used.get(row.x, 0) + 1
         common = sorted(set(TICKER_TO_GROUPS.get(row.y, [])) & set(TICKER_TO_GROUPS.get(row.x, [])))
-        picked.append((row.y, row.x, common[0] if common else "cross-sector", row.beta, row.adf_t, row.half_life, row.corr, row.sigma, row.mu))
+        picked.append((row.y, row.x, common[0] if common else "cross-sector", row.beta, row.adf_t, row.half_life,
+                       row.corr, row.sigma, row.t_1st_half, row.t_2nd_half, row.shift, row.mu))
         if len(picked) >= top_k:
             break
     return pd.DataFrame(picked, columns=cols)
@@ -196,20 +239,9 @@ def pair_zscore(py, px_, lookback=60, beta=None, mu=None, sigma=None):
     return resid / resid.rolling(lookback).std(), beta
 
 
-def pair_legs(py, px_, lookback=60, entry=2.0, exit_=0.5, stop=4.0, max_hold=30, use_macd=False,
-              beta=None, mu=None, sigma=None):
-    """Z-score pairs trade. Returns dollar weights for (y, x) with gross exposure 1 when in a trade.
-
-    Enter when |z| > entry (with use_macd, only once the MACD histogram of z has turned back
-    toward zero). Exit when z is back inside exit_ (exit_=0 means the spread crossed its mean).
-    stop is a z-score stop and max_hold a time stop in bars; pass None to switch either off.
-    After either stop the pair waits until |z| is back inside entry before it can trade again.
-    Pass beta, mu and sigma to trade a fixed spread instead of the rolling one (see pair_zscore).
-    """
-    z, b = pair_zscore(py, px_, lookback, beta, mu, sigma)
-    macd = z.ewm(span=12).mean() - z.ewm(span=26).mean()
-    hist = (macd - macd.ewm(span=9).mean()).values
-    zv = z.values
+def _run_states(zv, hist, entry=2.0, exit_=0.5, stop=4.0, max_hold=30, use_macd=False):
+    """The trading rules, bar by bar. Returns (positions, bars held at the end, armed at the end).
+    Position +1 is long the spread (long y, short x); -1 is short the spread."""
     state, held, armed = 0.0, 0, True
     pos = np.zeros(len(zv))
     for i in range(len(zv)):
@@ -233,14 +265,74 @@ def pair_legs(py, px_, lookback=60, entry=2.0, exit_=0.5, stop=4.0, max_hold=30,
             elif max_hold is not None and held >= max_hold:
                 state, armed = 0.0, False                   # time stop
         pos[i] = state
+    return pos, held, armed
+
+
+def _macd_hist(z):
+    macd = z.ewm(span=12).mean() - z.ewm(span=26).mean()
+    return (macd - macd.ewm(span=9).mean()).values
+
+
+def pair_legs(py, px_, lookback=60, entry=2.0, exit_=0.5, stop=4.0, max_hold=30, use_macd=False,
+              beta=None, mu=None, sigma=None):
+    """Z-score pairs trade. Returns dollar weights for (y, x) with gross exposure 1 when in a trade.
+
+    Enter when |z| > entry (with use_macd, only once the MACD histogram of z has turned back
+    toward zero). Exit when z is back inside exit_ (exit_=0 means the spread crossed its mean).
+    stop is a z-score stop and max_hold a time stop in bars; pass None to switch either off.
+    After either stop the pair waits until |z| is back inside entry before it can trade again.
+    Pass beta, mu and sigma to trade a fixed spread instead of the rolling one (see pair_zscore).
+    """
+    z, b = pair_zscore(py, px_, lookback, beta, mu, sigma)
+    pos, _, _ = _run_states(z.values, _macd_hist(z), entry, exit_, stop, max_hold, use_macd)
     s = pd.Series(pos, index=py.index)
     b = b.clip(0.1, 5).fillna(0)
     gross = 1 + b
     return s / gross, -s * b / gross
 
 
-def mr_weights(px, pairs, fixed=False, hold_half_lives=None, **kw):
+def current_signals(px, pairs, fixed=False, hold_half_lives=None, lookback=60, entry=2.0, exit_=0.5,
+                    stop=4.0, max_hold=30, use_macd=False, slots=None):
+    """Where each screened pair stands after the last close in px, using the same rules as the backtest.
+
+    Status is "New entry" (position opened at the last close), "Open" (opened earlier, still held),
+    "Waiting" (z is past the entry level but the rules block a trade) or "No signal".
+    """
+    rows = []
+    for p in pairs.itertuples(index=False):
+        hold = int(max(2, round(hold_half_lives * p.half_life))) if hold_half_lives else max_hold
+        fx = dict(beta=p.beta, mu=p.mu, sigma=p.sigma) if fixed else {}
+        z, b = pair_zscore(px[p.y], px[p.x], lookback, **fx)
+        pos, held, armed = _run_states(z.values, _macd_hist(z), entry, exit_, stop, hold, use_macd)
+        z_now, side = float(z.iloc[-1]), pos[-1]
+        hedge = float(np.clip(b.iloc[-1], 0.1, 5)) if np.isfinite(b.iloc[-1]) else np.nan
+        wy, wx = 1 / (1 + hedge), hedge / (1 + hedge)
+        row = {"pair": f"{p.y}/{p.x}", "group": p.group, "z": z_now, "status": "No signal", "trade": "",
+               "long": "", "short": "", "long_wt": np.nan, "short_wt": np.nan, "entered": None,
+               "days_held": np.nan, "days_to_time_stop": np.nan, "half_life": p.half_life, "hedge_ratio": hedge}
+        if side != 0:
+            lng, sht = (p.y, p.x) if side > 0 else (p.x, p.y)
+            row.update(status="New entry" if held == 0 else "Open", trade=f"Long {lng} / Short {sht}",
+                       long=lng, short=sht, long_wt=wy if side > 0 else wx, short_wt=wx if side > 0 else wy,
+                       entered=px.index[len(px) - 1 - held].date(), days_held=held,
+                       days_to_time_stop=(hold - held) if hold is not None else np.nan)
+        elif np.isfinite(z_now) and abs(z_now) >= entry:
+            why = ("past the stop level" if stop is not None and abs(z_now) >= stop else
+                   "stopped out, re-arms inside entry" if not armed else "MACD has not turned")
+            row.update(status=f"Waiting ({why})")
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if len(out):
+        order = out["status"].map(lambda v: 0 if v == "New entry" else 1 if v == "Open" else 2 if v.startswith("Waiting") else 3)
+        out = out.assign(_o=order, _a=out["z"].abs()).sort_values(["_o", "_a"], ascending=[True, False]).drop(columns=["_o", "_a"])
+    return out.reset_index(drop=True)
+
+
+def mr_weights(px, pairs, fixed=False, hold_half_lives=None, slots=None, **kw):
     """Equal capital per pair. pairs is the screen_pairs table (or a list of (y, x) tuples).
+
+    slots is the number of pairs the book is sized for: each pair gets 1/slots of capital even
+    when fewer pass the screen, so a thin screen gives a small book, not a concentrated one.
 
     fixed=True trades each pair with the hedge ratio, mean and sigma frozen from the screen window.
     hold_half_lives sets each pair's time stop to that multiple of its own half-life.
@@ -248,6 +340,7 @@ def mr_weights(px, pairs, fixed=False, hold_half_lives=None, **kw):
     if not isinstance(pairs, pd.DataFrame):
         pairs = pd.DataFrame(list(pairs), columns=["y", "x"])
     w = pd.DataFrame(0.0, index=px.index, columns=px.columns)
+    n = max(len(pairs), slots or 0)
     for p in pairs.itertuples(index=False):
         k = dict(kw)
         if fixed:
@@ -255,8 +348,8 @@ def mr_weights(px, pairs, fixed=False, hold_half_lives=None, **kw):
         if hold_half_lives:
             k["max_hold"] = int(max(2, round(hold_half_lives * p.half_life)))
         wy, wx = pair_legs(px[p.y], px[p.x], **k)
-        w[p.y] += wy / len(pairs)
-        w[p.x] += wx / len(pairs)
+        w[p.y] += wy / n
+        w[p.x] += wx / n
     return w
 
 
